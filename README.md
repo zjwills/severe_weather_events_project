@@ -5,7 +5,7 @@ This is a personal project to analyze severe weather events in the U.S. The data
 # FINDINGS
 A summary of my findings can be found here including visualizations on Tableau Public.
 - Personal Projects Portfolio: https://rectangular-thief-f3c.notion.site/Portfolio-192ad11e127d80b1ad03cf25a2dbdb21?pvs=4
-- Tableau Public: URL to be added
+- Tableau Public: https://public.tableau.com/views/severe_weather_events_project/LandscapeofStorms?:language=en-US&:sid=&:redirect=auth&:display_count=n&:origin=viz_share_link
 
 
 
