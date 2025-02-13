@@ -1,0 +1,282 @@
+# Python used to ingest and organize data 
+
+# INGESTION
+# Files from SOURCE downloaded as 50 compressed CSV files, each file containing annual severe weather event data.
+# Unzip CSV files from one directory and placed unzipped CSV files into a new one
+
+import os
+import gzip
+import shutil
+
+# Define source and destination directories
+source_dir = 'zipped_files/'
+destination_dir = 'unzipped_files/'
+
+# Check to ensure the destination directory exists
+os.makedirs(destination_dir, exist_ok=True)
+
+# Iterate through all files in the source directory
+for filename in os.listdir(source_dir):
+    if filename.endswith('.gz'):  # Check for .gz extension
+        source_file_path = os.path.join(source_dir, filename)
+        destination_file_path = os.path.join(destination_dir, filename[:-3])  # Remove '.gz' for output file name
+        
+        # Decompress the .gz file and write to the destination directory
+        with gzip.open(source_file_path, 'rb') as f_in:
+            with open(destination_file_path, 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
+
+print("Decompression complete. Files moved to:", destination_dir)
+
+# Remove unnecessary columns in order to keep file size down for later import. Specify a starting and ending directory as well as list of columns I want to keep.
+
+import os
+import pandas as pd
+
+# Define source and destination directories
+source_dir = 'unzipped_files/'
+destination_dir = 'reduced_files'
+
+# List of columns to keep
+columns_to_keep = [
+    'BEGIN_YEARMONTH',
+    'BEGIN_YEARMONTH',
+    'BEGIN_DAY',
+    'BEGIN_TIME',
+    'END_YEARMONTH',
+    'END_DAY',
+    'END_TIME',
+    'EPISODE_ID',
+    'EVENT_ID',
+    'STATE',
+    'YEAR',
+    'MONTH_NAME',
+    'EVENT_TYPE',
+    'BEGIN_DATE_TIME',
+    'END_DATE_TIME',
+    'INJURIES_DIRECT',
+    'INJURIES_INDIRECT',
+    'DEATHS_DIRECT',
+    'DEATHS_INDIRECT',
+    'DAMAGE_PROPERTY',
+    'DAMAGE_CROPS',
+    'MAGNITUDE',
+    'MAGNITUDE_TYPE',
+    'FLOOD_CAUSE',
+    'TOR_F_SCALE',
+    'TOR_LENGTH',
+    'TOR_WIDTH',
+    'BEGIN_LAT',
+    'BEGIN_LON',
+    'END_LAT',
+    'END_LON'
+    ]  
+
+# Ensure the destination directory exists
+os.makedirs(destination_dir, exist_ok=True)
+
+# Iterate through all CSV files in the source directory
+for filename in os.listdir(source_dir):
+    if filename.endswith('.csv'):  # Process only .csv files
+        source_file_path = os.path.join(source_dir, filename)
+        destination_file_path = os.path.join(destination_dir, filename)
+        
+        # Read the specific columns from the source CSV
+        try:
+            df = pd.read_csv(source_file_path, usecols=columns_to_keep)
+            # Write the filtered data to a new CSV file in the destination directory
+            df.to_csv(destination_file_path, index=False)
+            print(f"Processed: {filename}")
+        except ValueError as e:
+            print(f"Skipping {filename}: {e}")
+
+print("Processing complete. Filtered files saved to:", destination_dir)
+
+# Rename the files so that I can more easily group them by year in the next step
+
+import os
+import re
+
+def rename_storm_event_files(directory):
+    try:
+        # List all files in the directory and check if they match naming convetion
+        for filename in os.listdir(directory):
+            match = re.match(r"StormEvents_details-ftp_v1\.0_d(\d{4})", filename)
+            if match:
+                # Extract year
+                year = match.group(1)
+                
+                # Create new filename
+                new_filename = f"StormEvents_Details_{year}"
+                
+                # Preserve the original file extension
+                file_extension = os.path.splitext(filename)[1]
+                new_filename_with_ext = new_filename + file_extension
+                
+                # Get full paths for renaming
+                old_file_path = os.path.join(directory, filename)
+                new_file_path = os.path.join(directory, new_filename_with_ext)
+                
+                # Rename the file
+                os.rename(old_file_path, new_file_path)
+                print(f"Renamed: {filename} -> {new_filename_with_ext}")
+        
+        print("All matching files have been renamed.")
+    
+    except FileNotFoundError:
+        print("Error: The specified directory does not exist.")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+# Combine 50 CSVs into batches less than 100mbs, the file import size limit of BigQuery. 
+# NOTE: I ran into issues with inconsistent datatypes across the fifty files. To address this, I changed the datatype to STRING for the relevant columns.
+
+def group_and_merge_csvs(input_dir, output_subdir, reference_file, string_columns):
+    # Define year ranges and output file names. Limit groups to less than 85MB.
+    year_ranges = {
+        "2024-2018": range(2018, 2025),
+        "2017-2010": range(2010, 2018),
+        "2009-2001": range(2001, 2010),
+        "1975-2000": range(1975, 2001)
+    }
+
+    # Create the output subdirectory if it doesn't exist
+    output_dir = os.path.join(input_dir, output_subdir)
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Load the reference file to extract its schema
+    reference_df = pd.read_csv(reference_file)
+    reference_dtypes = reference_df.dtypes.to_dict()  # Save column data types
+
+    # Ensure specified columns are treated as strings
+    for col in string_columns:
+        reference_dtypes[col] = 'string'
+
+    # Initialize dataframes for each group
+    grouped_data = {key: [] for key in year_ranges.keys()}
+
+    # Process each file in the input directory
+    for filename in os.listdir(input_dir):
+        if filename.startswith("StormEvents_Details_") and filename.endswith(".csv"):
+            try:
+                # Extract the year from the filename
+                year = int(filename.split("_")[-1].split(".")[0])
+
+                # Determine which group the file belongs to
+                assigned_group = None
+                for group_name, year_range in year_ranges.items():
+                    if year in year_range:
+                        assigned_group = group_name
+                        print(f"File: {filename} | Year: {year} | Assigned Group: {assigned_group}")
+                        break
+
+                if not assigned_group:
+                    print(f"File: {filename} | Year: {year} | Not assigned to any group.")
+                    continue
+
+                # Read the CSV file with explicit dtypes and low_memory=False
+                file_path = os.path.join(input_dir, filename)
+                df = pd.read_csv(
+                    file_path,
+                    dtype=reference_dtypes,
+                    low_memory=False  # Ensures consistent type inference across chunks
+                )
+
+                # Coerce specific columns to strings and handle NaN values
+                for col in string_columns:
+                    if col in df.columns:
+                        df[col] = df[col].fillna("").astype(str)
+
+                grouped_data[assigned_group].append(df)
+
+            except ValueError:
+                print(f"Skipping file due to invalid format: {filename}")
+            except Exception as e:
+                print(f"Error processing {file_path}: {e}")
+
+    # Merge and save each group to a master CSV file
+    for group_name, dataframes in grouped_data.items():
+        if dataframes:
+            # Concatenate all dataframes in this group
+            merged_df = pd.concat(dataframes, ignore_index=True)
+
+            # Write to a single CSV file
+            output_file = os.path.join(output_dir, f"{group_name}.csv")
+            merged_df.to_csv(output_file, index=False)
+
+            print(f"Group '{group_name}' has been saved to {output_file}")
+
+# Two columns include 'h', 'k', 'm', or 'b' to indicate number of digits: '000', '0000' etc. 
+# Create a function to process specific columns and append new column at the end with numerical values rather than strings
+# Create a second function to call first function across all files in my directory
+
+import os
+import pandas as pd
+
+def process_and_update_csv(file_path, col1, col2):
+
+    def convert_suffix(value):
+        """
+        Converts string values with suffixes ('h', 'k', 'm', 'b') to numerical values.
+        """
+        if isinstance(value, str):  # Check if the value is a string
+            value = value.lower()  # Ensure case-insensitivity
+            try:
+                if value.endswith('h'):
+                    return float(value[:-1]) * 100
+                elif value.endswith('k'):
+                    return float(value[:-1]) * 1_000
+                elif value.endswith('m'):
+                    return float(value[:-1]) * 1_000_000
+                elif value.endswith('b'):
+                    return float(value[:-1]) * 1_000_000_000
+            except ValueError:
+                return None  # Handle invalid numeric values gracefully
+        try:
+            return float(value)  # Convert directly to float if no suffix is present
+        except ValueError:
+            return None  # Handle invalid values gracefully
+
+    try:
+        # Read the entire CSV file into a DataFrame
+        df = pd.read_csv(file_path)
+
+        # Process the specified columns and create new columns for cleaned data
+        df[f"{col1}_VALUES"] = df[col1].apply(convert_suffix)
+        df[f"{col2}_VALUES"] = df[col2].apply(convert_suffix)
+
+        # Write the updated DataFrame back to the same CSV file
+        df.to_csv(file_path, index=False)
+        
+        print(f"The file '{file_path}' has been updated with cleaned columns '{col1}_VALUES' and '{col2}_VALUES'.")
+    except FileNotFoundError:
+        print(f"Error: The file '{file_path}' does not exist.")
+    except KeyError as e:
+        print(f"Error: Column {e} does not exist in the file '{file_path}'.")
+    except Exception as e:
+        print(f"An unexpected error occurred while processing '{file_path}': {e}")
+
+
+def process_directory(directory, col1, col2):
+    """
+    Processes all CSV files in a directory by applying `process_and_update_csv`.
+
+    Args:
+        directory (str): Path to the directory containing CSV files.
+        col1 (str): Name of the first column to process.
+        col2 (str): Name of the second column to process.
+    """
+    for filename in os.listdir(directory):
+        if filename.endswith(".csv"):  # Only process CSV files
+            file_path = os.path.join(directory, filename)
+            print(f"Processing file: {file_path}")
+            process_and_update_csv(file_path, col1, col2)
+
+
+input_directory = 'reduced_files/merged_files/'  
+col1 = 'DAMAGE_PROPERTY'  
+col2 = 'DAMAGE_CROPS'     
+
+process_directory(input_directory, col1, col2)
+
+
