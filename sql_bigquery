@@ -1,0 +1,294 @@
+-- SQL written in BigQuery for data exploration, cleaning, and analysis
+
+-- Imported dataset in 4 parts due to file size limitations. Compile into a single table with 1.88M rows. 
+
+CREATE TABLE  severe_weather_events.details_annual_compiled
+  AS
+
+  SELECT * FROM `severe_weather_events.details_1975_2000`
+  UNION ALL
+  SELECT * FROM `severe_weather_events.details_2001_2009`
+  UNION ALL
+  SELECT * FROM `severe_weather_events.details_2010_2017`
+  UNION ALL
+  SELECT * FROM `severe_weather_events.details_2018_2024`;
+
+-- With everything in one place, I see a few changes I want to make.
+-- Create TEMP table so I don't have to repeat multiple CTEs in each query as I go.
+    -- EVENT_TYPE: Filter data to get only 2000 and later. 3 event_types tracked up unitl 1992, 4 in 1993, 5 in 1994, 13 in 1995, and 34 in 1996. It continues to climb in small increments over time and becomes more consistent after 1999.
+    -- STATE: Currently includes US territories. Filter for 50 states + D.C.
+
+CREATE TEMPORARY TABLE details_filtered AS
+WITH state_list AS (
+  SELECT state_name
+  FROM `bigquery-public-data.geo_us_boundaries.states`
+  WHERE 
+    state_fips_code NOT IN ('60', '66', '69', '72', '78') -- Exclude territories
+  ORDER BY state_name
+),
+consolidated_event_types AS (
+  SELECT
+    CASE
+      WHEN UPPER(TRIM(EVENT_TYPE)) LIKE "%HURRICANE%" THEN "Hurricane"
+      WHEN UPPER(TRIM(EVENT_TYPE)) LIKE "%VOLCANIC ASH%" THEN "Volcanic Ash"
+      ELSE EVENT_TYPE
+    END AS EVENT_TYPE_CONSOLIDATED,
+    *
+  FROM `severe_weather_events.details_annual_compiled`
+
+)
+
+SELECT *
+FROM consolidated_event_types
+WHERE YEAR > 1999
+AND STATE IN (SELECT UPPER(state_name) FROM state_list);
+
+
+-- Get count of unique event_types used: 46 different storm event types used since 2000
+
+SELECT DISTINCT 
+  EVENT_TYPE_CONSOLIDATED
+FROM details_filtered;
+
+-- Number of Severe Weather Events (SWEs) per year
+-- Finding: Overall trend toward more SWEs per year, but not a drastic change
+
+SELECT
+  YEAR,
+  EVENT_TYPE_CONSOLIDATED,
+  COUNT(EVENT_ID) AS NUM_EVENTS
+FROM details_filtered
+GROUP BY YEAR, EVENT_TYPE_CONSOLIDATED
+ORDER BY YEAR;
+
+-- Break that out by State
+SELECT
+  YEAR,
+  STATE,
+  EVENT_TYPE_CONSOLIDATED,
+  COUNT(EVENT_ID) AS NUM_EVENTS
+FROM details_filtered
+GROUP BY YEAR, STATE, EVENT_TYPE_CONSOLIDATED
+ORDER BY YEAR, STATE;
+
+-- Identify outliers: Calculate basic descriptive stats for 25 years to later compare to individual years
+
+WITH events_per_year AS (
+  SELECT YEAR, COUNT(DISTINCT EVENT_ID) AS NUM_EVENTS
+  FROM details_filtered
+  GROUP BY YEAR
+),
+median_events AS (
+  SELECT PERCENTILE_CONT(NUM_EVENTS, 0.5) OVER () AS MEDIAN_EVENTS
+  FROM (SELECT ARRAY_AGG(NUM_EVENTS) AS num_events_arr FROM events_per_year), 
+       UNNEST(num_events_arr) AS NUM_EVENTS
+),
+mode_events AS (
+  SELECT NUM_EVENTS AS MODE_EVENTS
+  FROM events_per_year
+  GROUP BY NUM_EVENTS
+  ORDER BY COUNT(*) DESC
+  LIMIT 1
+), 
+total_events AS (
+  SELECT SUM(NUM_EVENTS) AS TOTAL_EVENTS FROM events_per_year
+)
+SELECT
+  AVG(NUM_EVENTS) AS MEAN_EVENTS,
+  (SELECT MEDIAN_EVENTS FROM median_events LIMIT 1) AS MEDIAN_EVENTS,
+  (SELECT MODE_EVENTS FROM mode_events LIMIT 1) AS MODE_EVENTS,
+  STDDEV(NUM_EVENTS) AS STD_DEV_EVENTS,
+  (SELECT TOTAL_EVENTS FROM total_events LIMIT 1) AS TOTAL_EVENTS
+FROM events_per_year;
+
+-- What are the most frequent storm types (event_type) from the last 25 years? What percentage do they make up?
+-- Result: 1,561,384 SWEs since 1999. Thunderstorms make up 26.32%, Hail 19.61%, and Flash Flood 6.19%
+
+SELECT
+  EVENT_TYPE,
+  COUNT(*) AS NUM_EVENTS,
+  SUM(COUNT(*)) OVER () AS NUMBER_OF_EVENTS_CUMULATIVE,
+  SAFE_DIVIDE(COUNT(*), SUM(COUNT(*)) OVER ()) * 100 AS PCT_TOTAL_EVENTS
+FROM details_filtered
+GROUP BY EVENT_TYPE
+ORDER BY NUM_EVENTS DESC
+LIMIT 10;
+
+-- What type of SWE has occured the most frequently in each state?
+
+WITH top_event_type AS (
+  SELECT
+    STATE,
+    EVENT_TYPE AS TOP_EVENT_TYPE,
+    RANK() OVER (PARTITION BY STATE ORDER BY COUNT(*) DESC) AS EVENT_RANK
+  FROM details_filtered
+  GROUP BY STATE, EVENT_TYPE
+  QUALIFY EVENT_RANK = 1
+),
+state_events AS (
+  SELECT 
+    STATE, 
+    YEAR,
+    COUNT(DISTINCT EVENT_ID) AS NUM_EVENTS 
+  FROM details_filtered
+  GROUP BY STATE, YEAR
+)
+SELECT
+  se.STATE,
+  t.TOP_EVENT_TYPE,
+  SUM(se.NUM_EVENTS) AS TOTAL_EVENTS_PER_STATE,
+  AVG(se.NUM_EVENTS) AS AVG_EVENTS_PER_STATE
+FROM state_events se
+JOIN top_event_type t ON t.STATE = se.STATE
+GROUP BY se.STATE, t.TOP_EVENT_TYPE
+ORDER BY se.STATE;
+
+
+-- What state gets the most SWEs on average? The least? 
+-- Results: Texas is the winner with 4,350 SWEs a year on average. Washington DC is the safest with an average of 32 SWEs per year.
+-- VIEW Top 10 for states with the most SWEs per year on average.
+
+
+SELECT
+  STATE,
+  AVG(NUM_EVENTS) AS AVG_EVENTS_PER_YEAR
+FROM   
+  (SELECT
+    STATE,
+    YEAR,
+    COUNT(EVENT_ID) AS NUM_EVENTS
+  FROM details_filtered
+  GROUP BY STATE, YEAR
+  ORDER BY STATE, YEAR
+  )
+  GROUP BY STATE
+  ORDER BY AVG(NUM_EVENTS) DESC;
+
+-- What are the most common SWEs by State?
+
+SELECT
+  STATE,
+  EVENT_TYPE,
+  RANK () OVER (PARTITION BY STATE ORDER BY NUM_EVENTS DESC) AS TOP_SWE
+FROM   
+  (SELECT
+    STATE,
+    YEAR,
+    EVENT_TYPE,
+    COUNT(EVENT_ID) AS NUM_EVENTS
+  FROM details_filtered
+  GROUP BY STATE, YEAR, EVENT_TYPE
+  ORDER BY STATE, YEAR
+  )
+  GROUP BY STATE, EVENT_TYPE, NUM_EVENTS
+  QUALIFY TOP_SWE = 1;
+
+-- How many different types of SWEs does each state get?
+-- Results: number is pretty similar across states. Texas leads with 41 different types. Rhode Island has only 25.
+
+SELECT
+  STATE,
+  COUNT(DISTINCT EVENT_TYPE) AS SWE_MIX
+FROM   
+  (SELECT
+    STATE,
+    YEAR,
+    EVENT_TYPE,
+    COUNT(EVENT_ID) AS NUM_EVENTS
+  FROM details_filtered
+  GROUP BY STATE, YEAR, EVENT_TYPE
+  ORDER BY STATE, YEAR
+  )
+  GROUP BY STATE;
+  
+-- STORM DAYS PER YEAR: How many days of the year is there at least one SWE?
+-- NOTE: data includes start and end dates. Need to include days between those as well.
+-- Start with National numbers
+-- Results: Starting in 1996, every day experienced at least one SWE. Expect that the type of SWEs tracked was adjusted around that time
+WITH DATE_RANGE AS (
+  SELECT
+    GENERATE_DATE_ARRAY(
+      DATE(SAFE.PARSE_DATETIME('%d-%b-%y %H:%M:%S', BEGIN_DATE_TIME)),
+      DATE(SAFE.PARSE_DATETIME('%d-%b-%y %H:%M:%S', END_DATE_TIME))
+    ) AS date_array
+  FROM details_filtered
+),
+unique_dates AS (
+  SELECT DISTINCT date
+  FROM DATE_RANGE,
+  UNNEST(date_array) AS date
+)
+SELECT 
+  EXTRACT(YEAR FROM date) AS YEAR,
+  COUNT(*) AS num_days_with_events
+FROM unique_dates
+GROUP BY YEAR;
+
+-- Same question but broken down by state
+-- Include average days per year for each state with window function. 
+-- Results: Texas has the highest average days per year = 329.7 days. Rhode Island has the lowest = 31.7 days.
+
+WITH DATE_RANGE AS (
+  SELECT
+    STATE,
+    GENERATE_DATE_ARRAY(
+      DATE(SAFE.PARSE_DATETIME('%d-%b-%y %H:%M:%S', BEGIN_DATE_TIME)),
+      DATE(SAFE.PARSE_DATETIME('%d-%b-%y %H:%M:%S', END_DATE_TIME))
+    ) AS date_array
+  FROM details_filtered
+),
+unique_dates AS (
+  SELECT 
+    STATE,
+    date
+  FROM DATE_RANGE,
+  UNNEST(date_array) AS date
+  GROUP BY STATE, date
+)
+SELECT
+  STATE,
+  EXTRACT(YEAR FROM date) AS YEAR,
+  COUNT(*) AS num_days_with_events,
+  AVG(COUNT(*)) OVER (PARTITION BY STATE) AS avg_days_with_events
+FROM unique_dates
+GROUP BY STATE, YEAR
+HAVING YEAR >= 1999
+ORDER BY STATE, YEAR ASC;
+
+-- I want to see if I can determine whether storms are lasting longer than before. To do that, I want to explore the DATETIME data a bit.
+-- NOTE: The query below will convert timestamps into a format that BigQuery can read, but will automatically list it as UTC. Since I am interested in the duration between BEGIN and END times, this is fine. If I need to use local time zones for accurate DATE calculations, I will need to bring that data back in with a join.
+-- EVENT_DURATION results listed with the following notation: YEARS-MONTHS DAYS HOURS:MINUTES:SECONDS
+
+WITH formatted_time AS (
+  SELECT
+    YEAR,
+    EVENT_ID,
+    EVENT_TYPE_CONSOLIDATED,
+    STATE,
+    PARSE_TIMESTAMP('%d-%b-%y %H:%M:%S', BEGIN_DATE_TIME) AS BEGIN_TIME,
+    PARSE_TIMESTAMP('%d-%b-%y %H:%M:%S', END_DATE_TIME) AS END_TIME
+  FROM details_filtered
+),
+  average_duration AS (
+    SELECT
+      EVENT_TYPE_CONSOLIDATED,
+      YEAR,
+      END_TIME - BEGIN_TIME AS EVENT_DURATION
+  FROM formatted_time
+  )
+/*
+SELECT
+  *,
+  END_TIME - BEGIN_TIME AS EVENT_DURATION
+FROM formatted_time;
+*/
+-- AVERAGE DURATION BY STORM TYPE AND YEAR
+
+SELECT
+  EVENT_TYPE_CONSOLIDATED,
+  YEAR,
+  AVG(EVENT_DURATION) AS AVG_DURATION,
+  ROUND(AVG(EXTRACT(HOUR FROM EVENT_DURATION) + EXTRACT(MINUTE FROM EVENT_DURATION) / 60.0), 2) AS AVG_DURATION_HOURS
+FROM average_duration
+GROUP BY 1, 2
+ORDER BY 1, 2, 3 DESC;
